@@ -44,7 +44,14 @@ import { createRecordingApi, createStreamApi } from './screen-recording.js'
 import { createDemoVideo } from './ffmpeg.js'
 import { type GhostCursorClientOptions } from './ghost-cursor.js'
 import { GhostCursorController } from './ghost-cursor-controller.js'
-import { clearHandoff, handoff, waitForHandoff, type HandoffOptions, type WaitForHandoffOptions } from './handoff.js'
+import {
+  clearHandoff,
+  handoff,
+  setHandoffYield,
+  waitForHandoff,
+  type HandoffOptions,
+  type WaitForHandoffOptions,
+} from './handoff.js'
 import { createCloudScope } from './cloud-scope.js'
 import { challengeWarning, detectChallenge, MAX_CHALLENGE_WAIT_MS, PROBE_TIMEOUT_MS } from './challenge-detection.js'
 import type { CloudAuth } from './cloud-client.js'
@@ -1521,7 +1528,17 @@ export class PlaywrightExecutor {
     code: string,
     { timeout = 10000, signal }: { timeout?: number; signal?: AbortSignal } = {},
   ): Promise<ExecuteResult> {
-    return this.runExclusive({ operation: () => this.executeInternal({ code, timeout, signal }) })
+    return this.runExclusive({
+      operation: async () => {
+        // Tabs handed to the user are theirs between executes, and the agent's while its code runs
+        await setHandoffYield({ context: this.context, enabled: false })
+        try {
+          return await this.executeInternal({ code, timeout, signal })
+        } finally {
+          await setHandoffYield({ context: this.context, enabled: true })
+        }
+      },
+    })
   }
 
   private async executeInternal({

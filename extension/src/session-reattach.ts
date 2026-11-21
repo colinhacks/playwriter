@@ -23,6 +23,11 @@ type TabSession = {
   setup: Map<string, SetupCommand>
   // Frames reported by Page.frameAttached. Frames removed while detached never get frameDetached.
   frameIds: Set<string>
+  // Document and url each frame showed last. A frame that navigated while detached never gets frameNavigated.
+  loaderIds: Map<string, string>
+  urls: Map<string, string>
+  // Frames whose current document we reported ourselves. Chrome's own event for it can still arrive.
+  announced: Set<string>
   reattachTimes: number[]
 }
 
@@ -48,7 +53,14 @@ const tabSessions = new Map<number, TabSession>()
 let nextInitScriptId = 1
 
 export function startTabSession(tabId: number): void {
-  tabSessions.set(tabId, { setup: new Map(), frameIds: new Set(), reattachTimes: [] })
+  tabSessions.set(tabId, {
+    setup: new Map(),
+    frameIds: new Set(),
+    loaderIds: new Map(),
+    urls: new Map(),
+    announced: new Set(),
+    reattachTimes: [],
+  })
 }
 
 export function endTabSession(tabId: number): void {
@@ -76,14 +88,110 @@ export function canReattach(tabId: number): boolean {
 }
 
 export function trackFrameEvent({ tabId, method, params }: { tabId: number; method: string; params: any }): void {
-  const frameIds = tabSessions.get(tabId)?.frameIds
+  const session = tabSessions.get(tabId)
+  if (!session) {
+    return
+  }
   if (method === 'Page.frameAttached') {
-    frameIds?.add(params.frameId)
+    session.frameIds.add(params.frameId)
   }
   // A swapped frame became an OOPIF, its child session reports it from now on.
   if (method === 'Page.frameDetached') {
-    frameIds?.delete(params.frameId)
+    session.frameIds.delete(params.frameId)
+    session.loaderIds.delete(params.frameId)
+    session.urls.delete(params.frameId)
+    session.announced.delete(params.frameId)
   }
+  if (method === 'Page.frameNavigated') {
+    session.frameIds.add(params.frame.id)
+    session.loaderIds.set(params.frame.id, params.frame.loaderId)
+    session.urls.set(params.frame.id, frameUrl(params.frame))
+    session.announced.delete(params.frame.id)
+  }
+  if (method === 'Page.navigatedWithinDocument') {
+    session.urls.set(params.frameId, params.url)
+  }
+}
+
+// True for Chrome's Page.frameNavigated of a document takeFrameChanges already reported. A second
+// event for the same document would make Playwright forget that the document had loaded.
+export function isAnnouncedDocument({ tabId, frame }: { tabId: number; frame: Protocol.Page.Frame }): boolean {
+  const session = tabSessions.get(tabId)
+  if (!session?.announced.has(frame.id) || session.loaderIds.get(frame.id) !== frame.loaderId) {
+    return false
+  }
+  session.announced.delete(frame.id)
+  return true
+}
+
+function frameUrl(frame: Protocol.Page.Frame): string {
+  return frame.url + (frame.urlFragment ?? '')
+}
+
+// Frames Playwright read with Page.getFrameTree, which sends no frameAttached for them.
+export function trackFrameTree({ tabId, frameTree }: { tabId: number; frameTree: Protocol.Page.FrameTree }): void {
+  const session = tabSessions.get(tabId)
+  if (!session) {
+    return
+  }
+  const visit = (tree: Protocol.Page.FrameTree) => {
+    session.frameIds.add(tree.frame.id)
+    session.loaderIds.set(tree.frame.id, tree.frame.loaderId)
+    session.urls.set(tree.frame.id, frameUrl(tree.frame))
+    ;(tree.childFrames ?? []).forEach(visit)
+  }
+  visit(frameTree)
+}
+
+type FrameChange = {
+  method: 'Page.frameAttached' | 'Page.frameNavigated' | 'Page.navigatedWithinDocument'
+  params: object
+}
+
+// Events Playwright missed while the tab was detached: frames that appeared, and frames that
+// show another document than the one Playwright saw last. Parents come before their children.
+export function takeFrameChanges({
+  tabId,
+  frameTree,
+  navigated,
+}: {
+  tabId: number
+  frameTree: Protocol.Page.FrameTree
+  // The main frame committed a document while detached (seen through chrome.webNavigation)
+  navigated: boolean
+}): FrameChange[] {
+  const session = tabSessions.get(tabId)
+  if (!session) {
+    return []
+  }
+  const changes: FrameChange[] = []
+  const visit = (tree: Protocol.Page.FrameTree, parentFrameId?: string, parentNavigated = false) => {
+    const { frame } = tree
+    // Playwright learns the main frame from the target itself, and forgets a frame's children
+    // when the frame navigates
+    const known = !parentFrameId || (!parentNavigated && session.frameIds.has(frame.id))
+    const lastLoaderId = known ? session.loaderIds.get(frame.id) : undefined
+    if (!known && parentFrameId) {
+      changes.push({ method: 'Page.frameAttached', params: { frameId: frame.id, parentFrameId } })
+    }
+    const newDocument = lastLoaderId ? lastLoaderId !== frame.loaderId : !parentFrameId && navigated
+    const lastUrl = session.urls.get(frame.id)
+    if (!known || newDocument) {
+      changes.push({ method: 'Page.frameNavigated', params: { frame, type: 'Navigation' } })
+      session.announced.add(frame.id)
+    } else if (lastUrl !== undefined && lastUrl !== frameUrl(frame)) {
+      // history.pushState and fragment changes keep the document
+      changes.push({ method: 'Page.navigatedWithinDocument', params: { frameId: frame.id, url: frameUrl(frame) } })
+    }
+    session.frameIds.add(frame.id)
+    session.loaderIds.set(frame.id, frame.loaderId)
+    session.urls.set(frame.id, frameUrl(frame))
+    ;(tree.childFrames ?? []).forEach((child) => {
+      visit(child, frame.id, !known || newDocument)
+    })
+  }
+  visit(frameTree)
+  return changes
 }
 
 // Returns frames Playwright still knows that are missing from the reattached frame tree.
@@ -182,20 +290,57 @@ export function recordSetupCommand({ tabId, method, params }: { tabId: number; m
 export async function replaySetup({
   tabId,
   send,
+  newDocument = false,
+  documentChanged = () => false,
 }: {
   tabId: number
   send: (method: string, params?: object) => Promise<unknown>
+  // The page loaded a document while detached, which no init script has run in yet
+  newDocument?: boolean
+  // Whether the main frame committed a document since this reattach began
+  documentChanged?: () => boolean
 }): Promise<Array<{ method: string; error: Error }>> {
   const failures: Array<{ method: string; error: Error }> = []
+  const addInitScript = async (command: SetupCommand, runImmediately: boolean): Promise<string> => {
+    const params = runImmediately ? { ...command.params, runImmediately: true } : command.params
+    const result = (await send(command.method, params)) as Protocol.Page.AddScriptToEvaluateOnNewDocumentResponse
+    return result.identifier
+  }
   for (const command of tabSessions.get(tabId)?.setup.values() ?? []) {
     try {
-      const result = await send(command.method, command.params)
-      if (command.method === 'Page.addScriptToEvaluateOnNewDocument') {
-        command.scriptIdentifier = (result as Protocol.Page.AddScriptToEvaluateOnNewDocumentResponse).identifier
+      if (command.method !== 'Page.addScriptToEvaluateOnNewDocument') {
+        await send(command.method, command.params)
+        continue
+      }
+      // Chrome runs an init script only in documents created after the script was added. A
+      // document that loaded while detached, or that commits during this replay, needs it run now.
+      const runImmediately = newDocument || documentChanged()
+      command.scriptIdentifier = await addInitScript(command, runImmediately)
+      if (!runImmediately && documentChanged()) {
+        // The document committed while the command was in flight, so whether it has the script
+        // is unknown. Running it twice is safer than never: add it again, then drop the first.
+        const first = command.scriptIdentifier
+        command.scriptIdentifier = await addInitScript(command, true)
+        await send('Page.removeScriptToEvaluateOnNewDocument', { identifier: first })
       }
     } catch (error) {
       failures.push({ method: command.method, error: error instanceof Error ? error : new Error(String(error)) })
     }
   }
   return failures
+}
+
+// Chrome sends the lifecycle events of the current documents again. Needed after reporting a
+// navigation late, because Playwright resets a frame's load state on Page.frameNavigated.
+export async function replayLifecycleEvents({
+  tabId,
+  send,
+}: {
+  tabId: number
+  send: (method: string, params?: object) => Promise<unknown>
+}): Promise<void> {
+  const command = tabSessions.get(tabId)?.setup.get('Page.setLifecycleEventsEnabled')
+  if (command) {
+    await send(command.method, command.params)
+  }
 }

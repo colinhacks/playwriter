@@ -1021,17 +1021,18 @@ describe('Relay Navigation Tests', () => {
             }
             const host = document.createElement('div')
             const root = host.attachShadow({ mode: 'closed' })
-            ;(window as any).__closedRoot = root
+            ;(window as any).__closedHost = host
             root.appendChild(iframe)
             document.body.appendChild(host)
           },
           { id: fixtureExtId, shadow },
         )
-        // The extension removes the iframe right before reattaching
+        // The extension removes the iframe right before reattaching. In a closed shadow root it
+        // removes the host, which is what makes an extension like Proton Pass rebuild its UI.
         await page.waitForFunction(
           () => {
-            const root = (window as any).__closedRoot as { querySelector: (selector: string) => unknown } | undefined
-            return !document.querySelector('iframe') && !root?.querySelector('iframe')
+            const host = (window as any).__closedHost as { isConnected: boolean } | undefined
+            return !document.querySelector('iframe') && !host?.isConnected
           },
           undefined,
           { timeout: 5000 },

@@ -38,8 +38,12 @@ import {
   resolveSetupParams,
   startTabSession,
   tabSessionIds,
+  takeFrameChanges,
   takeRemovedFrameIds,
   trackFrameEvent,
+  trackFrameTree,
+  isAnnouncedDocument,
+  replayLifecycleEvents,
 } from './session-reattach'
 import {
   REMOTE_TUNNEL_BASE_DOMAIN,
@@ -681,6 +685,9 @@ export const store = createStore<ExtensionState>(() => ({
 
 // @ts-ignore
 globalThis.toggleExtensionForActiveTab = toggleExtensionForActiveTab
+globalThis.getYieldState = () => {
+  return { yieldMode: [...yieldModeTabs], yielded: [...yieldedTabs.keys()] }
+}
 // @ts-ignore
 globalThis.disconnectEverything = disconnectEverything
 // @ts-ignore
@@ -696,6 +703,7 @@ globalThis.runMenuItemForActiveTab = runMenuItemForActiveTab
 
 declare global {
   var toggleExtensionForActiveTab: () => Promise<{ isConnected: boolean; state: ExtensionState }>
+  var getYieldState: () => { yieldMode: number[]; yielded: number[] }
   var getExtensionState: () => ExtensionState
   var disconnectEverything: () => Promise<void>
   var startRemoteControlForActiveTab: () => Promise<{ url: string }>
@@ -1427,9 +1435,46 @@ async function handleCommand(
   if (remoteRuntime && targetTabId !== undefined && userApprovedExtensionPageTabs.has(targetTabId)) {
     throw new Error('Remote control cannot use Playwriter extension pages.')
   }
+  // Not CDP: commands of our own, sent on a tab's session. Chrome answers "wasn't found" to
+  // an extension that predates them, which is how a client learns it cannot yield.
+  const playwriterMethod: string = msg.params.method
+  if (targetTabId !== undefined && targetTab && msg.params.sessionId === targetTab.sessionId) {
+    if (playwriterMethod === 'Playwriter.setYield') {
+      const enabled = Boolean((msg.params.params as { enabled?: boolean } | undefined)?.enabled)
+      await setYieldMode({ tabId: targetTabId, enabled })
+      return { yielded: yieldedTabs.has(targetTabId) }
+    }
+    if (playwriterMethod === 'Playwriter.resume') {
+      const resumed = await resumeTab({ tabId: targetTabId, reason: 'client asked' })
+      return { resumed }
+    }
+  }
   // Hold commands while reattachTab restores the session (same sessionId), Chrome would reject them.
-  if (targetTabId) {
-    await tabReattaches.get(targetTabId)
+  // That includes the evaluates Playwright sends as soon as the replay reports the contexts again.
+  while (targetTabId && (tabReattaches.has(targetTabId) || tabResumes.has(targetTabId))) {
+    await (tabReattaches.get(targetTabId) ?? tabResumes.get(targetTabId))
+  }
+  // A client that sends a command wants the tab back, with two exceptions. The relay's focus
+  // signal arrives when an execute ends, so it is kept for the next attach. And a yielded tab has
+  // no execution contexts, so a Runtime command naming one is Playwright cleaning up after the
+  // evaluates the detach interrupted: it gets the answer Chrome gives for a context that is gone.
+  if (targetTabId !== undefined && yieldedTabs.has(targetTabId)) {
+    const method = msg.params.method
+    const params = msg.params.params as Record<string, unknown> | undefined
+    if (method === 'Emulation.setFocusEmulationEnabled' && msg.params.sessionId === targetTab?.sessionId) {
+      recordSetupCommand({ tabId: targetTabId, method, params })
+      return {}
+    }
+    if (method === 'Runtime.releaseObject' || method === 'Runtime.releaseObjectGroup') {
+      return {}
+    }
+    const namesContext = ['objectId', 'executionContextId', 'contextId', 'uniqueContextId'].some((key) => {
+      return params?.[key] !== undefined
+    })
+    if (method.startsWith('Runtime.') && namesContext) {
+      throw new Error('Cannot find context with specified id')
+    }
+    await resumeTab({ tabId: targetTabId, reason: `command ${method}` })
   }
 
   const debuggee = targetTabId ? { tabId: targetTabId } : undefined
@@ -1560,6 +1605,9 @@ async function handleCommand(
   if (!isRootSession) {
     return result
   }
+  if (method === 'Page.getFrameTree') {
+    trackFrameTree({ tabId: debuggee.tabId, frameTree: (result as Protocol.Page.GetFrameTreeResponse).frameTree })
+  }
   if (method === 'Page.addScriptToEvaluateOnNewDocument') {
     return recordInitScript({
       tabId: debuggee.tabId,
@@ -1600,6 +1648,9 @@ function onDebuggerEvent(source: chrome.debugger.DebuggerSession, method: string
   }
 
   if (!source.sessionId && source.tabId) {
+    if (method === 'Page.frameNavigated' && isAnnouncedDocument({ tabId: source.tabId, frame: params.frame })) {
+      return
+    }
     trackFrameEvent({ tabId: source.tabId, method, params })
   }
 
@@ -1696,6 +1747,8 @@ function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.de
       detachTabFromPlaywright(detachedTabId, tab)
     }
 
+    yieldModeTabs.clear()
+    yieldedTabs.clear()
     store.setState({ tabs: new Map(), connectionState: 'idle', errorText: undefined })
     return
   }
@@ -1710,6 +1763,7 @@ function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.de
     if (tab) {
       detachTabFromPlaywright(tabId, tab)
     }
+    forgetYield(tabId)
     store.setState((state) => {
       const newTabs = new Map(state.tabs)
       newTabs.delete(tabId)
@@ -1720,7 +1774,20 @@ function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.de
 
   const tab = store.getState().tabs.get(tabId)
   if (reason === chrome.debugger.DetachReason.TARGET_CLOSED && tab?.state === 'connected') {
-    const reattach = reattachTab({ tabId, tab })
+    if (yieldModeTabs.has(tabId)) {
+      // Before the first await, like reattachTab: a wait whose evaluate just died must find
+      // no context to retry in, or its retry would ask for the tab back.
+      sendMessage({
+        method: 'forwardCDPEvent',
+        params: { sessionId: tab.sessionId, method: 'Runtime.executionContextsCleared', params: {} },
+      })
+    }
+    const reattach = (async () => {
+      if (yieldModeTabs.has(tabId) && (await yieldTab({ tabId, tab }))) {
+        return true
+      }
+      return await reattachTab({ tabId, tab })
+    })()
       .then((reattached) => {
         if (!reattached) {
           dropTab()
@@ -1737,16 +1804,157 @@ function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.de
   dropTab()
 }
 
+// Yielding: letting another extension keep its frame in a tab.
+//
+// Chrome allows either our debugger or another extension's frame in a tab, never both (see
+// session-reattach.ts). Removing the frame keeps the agent attached but breaks that extension's
+// UI, for example a password manager's menu on a sign-in page. While a client has switched on
+// yield mode for a tab (the user is acting in it, see handoff() in playwriter/src/handoff.ts),
+// we stay detached instead and take the tab back when the page moves on or the client acts.
+// The tab keeps its Playwright page: resumeTab reattaches with the same sessionId.
+const yieldModeTabs = new Set<number>()
+// Tabs we left detached. navigated: the main frame committed a document meanwhile.
+const yieldedTabs = new Map<number, { navigated: boolean; check?: ReturnType<typeof setTimeout> }>()
+const tabResumes = new Map<number, Promise<boolean>>()
+
+// A frame is hidden while it loads, and a menu takes a moment to open after the click that
+// created its frame. Checking sooner would take the tab back before the menu ever showed.
+const YIELD_GRACE_MS = 3000
+const YIELD_CHECK_MS = 1000
+
+function forgetYield(tabId: number): void {
+  yieldModeTabs.delete(tabId)
+  clearTimeout(yieldedTabs.get(tabId)?.check)
+  yieldedTabs.delete(tabId)
+  mainFrameNavigations.delete(tabId)
+}
+
+async function yieldTab({ tabId, tab }: { tabId: number; tab: TabInfo }): Promise<boolean> {
+  // target_closed has other causes (a crash, a restricted page). Yield only to a frame we can see.
+  const frames = await findRestrictedIframes(tabId)
+  if (frames.length === 0 || !yieldModeTabs.has(tabId)) {
+    return false
+  }
+  // Without execution contexts Playwright's waits park until resumeTab reports the page again.
+  emitChildDetachesForTab(tabId)
+  yieldedTabs.set(tabId, { navigated: false })
+  scheduleYieldCheck({ tabId, delay: YIELD_GRACE_MS })
+  logger.warn(`Yielding tab ${tabId} to another extension's frame`)
+  return true
+}
+
+// We stay away only while the other extension shows something. A frame it keeps hidden (Proton
+// Pass keeps its closed menu around) does not need the tab, and the client's waits do.
+function scheduleYieldCheck({ tabId, delay }: { tabId: number; delay: number }): void {
+  const yielded = yieldedTabs.get(tabId)
+  if (!yielded) {
+    return
+  }
+  yielded.check = setTimeout(async () => {
+    const frames = await findRestrictedIframes(tabId)
+    if (yieldedTabs.get(tabId) !== yielded) {
+      return
+    }
+    if (frames.some((frame) => frame.visible)) {
+      scheduleYieldCheck({ tabId, delay: YIELD_CHECK_MS })
+      return
+    }
+    void resumeTab({ tabId, reason: 'no visible frame of another extension' })
+  }, delay)
+}
+
+function resumeTab({ tabId, reason }: { tabId: number; reason: string }): Promise<boolean> {
+  const running = tabResumes.get(tabId)
+  if (running) {
+    return running
+  }
+  const yielded = yieldedTabs.get(tabId)
+  const tab = store.getState().tabs.get(tabId)
+  if (!yielded || !tab) {
+    return Promise.resolve(false)
+  }
+  clearTimeout(yielded.check)
+  yieldedTabs.delete(tabId)
+  logger.warn(`Resuming yielded tab ${tabId}: ${reason}`)
+  const resume = (async () => {
+    // A detach that is still deciding (yieldTab) must finish first
+    await tabReattaches.get(tabId)
+    const resumed = await reattachTab({ tabId, tab, navigated: yielded.navigated })
+    if (!resumed && store.getState().tabs.has(tabId)) {
+      sendMessage({
+        method: 'forwardCDPEvent',
+        params: { method: 'Target.detachedFromTarget', params: { sessionId: tab.sessionId, targetId: tab.targetId } },
+      })
+      forgetYield(tabId)
+      store.setState((state) => {
+        const newTabs = new Map(state.tabs)
+        newTabs.delete(tabId)
+        return { tabs: newTabs }
+      })
+      forgetRemoteTab(tabId)
+    }
+    return resumed
+  })().finally(() => {
+    tabResumes.delete(tabId)
+  })
+  tabResumes.set(tabId, resume)
+  return resume
+}
+
+async function setYieldMode({ tabId, enabled }: { tabId: number; enabled: boolean }): Promise<void> {
+  if (enabled) {
+    yieldModeTabs.add(tabId)
+    return
+  }
+  yieldModeTabs.delete(tabId)
+  await resumeTab({ tabId, reason: 'yield mode off' })
+}
+
+// Main frame navigations of connected tabs, counted from chrome.webNavigation because the
+// debugger reports none while detached. reattachTab compares counts to see what it missed.
+const mainFrameNavigations = new Map<number, { documents: number; total: number }>()
+
+function countNavigations(tabId: number): { documents: number; total: number } {
+  return mainFrameNavigations.get(tabId) ?? { documents: 0, total: 0 }
+}
+
+// Counts the navigation, and takes a yielded tab back: the page moved on, and the client's
+// waits should see it.
+function onMainFrameNavigation({ tabId, newDocument }: { tabId: number; newDocument: boolean }): void {
+  if (!store.getState().tabs.has(tabId)) {
+    return
+  }
+  const { documents, total } = countNavigations(tabId)
+  mainFrameNavigations.set(tabId, { documents: documents + (newDocument ? 1 : 0), total: total + 1 })
+  const yielded = yieldedTabs.get(tabId)
+  if (!yielded) {
+    return
+  }
+  yielded.navigated ||= newDocument
+  void resumeTab({ tabId, reason: newDocument ? 'new document' : 'url changed' })
+}
+
 // Chrome detached the tab because another extension injected its iframe (see session-reattach.ts).
 // Reattach with the same sessionId and restore the session so the Playwright page stays valid.
 const tabReattaches = new Map<number, Promise<boolean>>()
 
-async function reattachTab({ tabId, tab }: { tabId: number; tab: TabInfo }): Promise<boolean> {
+async function reattachTab({
+  tabId,
+  tab,
+  navigated,
+}: {
+  tabId: number
+  tab: TabInfo
+  // Set when resuming a yielded tab: whether its main frame committed a document meanwhile
+  navigated?: boolean
+}): Promise<boolean> {
   const { sessionId, targetId } = tab
   if (!sessionId || !targetId) {
     return false
   }
-  if (!canReattach(tabId)) {
+  const navigationsBefore = countNavigations(tabId)
+  // A yielded tab cannot loop: its next detach yields again instead of reattaching.
+  if (navigated === undefined && !canReattach(tabId)) {
     logger.warn(`Not reattaching tab ${tabId}: too many reattaches in a short time`)
     return false
   }
@@ -1770,26 +1978,50 @@ async function reattachTab({ tabId, tab }: { tabId: number; tab: TabInfo }): Pro
       throw new Error(`targetId changed after reattach: ${targetId} -> ${targetInfo.targetId}`)
     }
 
-    const { frameTree } = (await chrome.debugger.sendCommand(
-      { tabId },
-      'Page.getFrameTree',
-    )) as Protocol.Page.GetFrameTreeResponse
-    takeRemovedFrameIds({ tabId, frameTree }).forEach((frameId) => {
-      sendMessage({
-        method: 'forwardCDPEvent',
-        params: { sessionId, method: 'Page.frameDetached', params: { frameId, reason: 'remove' } },
+    const send = (method: string, params?: object) => {
+      return sendCommandWithTimeout({ tabId }, method, params, 10000)
+    }
+    // Tells Playwright what changed in the frame tree since the events it saw last.
+    // Returns whether a frame shows a document Playwright had not heard of.
+    const reportFrames = async ({ navigated }: { navigated: boolean }): Promise<boolean> => {
+      const { frameTree } = (await send('Page.getFrameTree')) as Protocol.Page.GetFrameTreeResponse
+      takeRemovedFrameIds({ tabId, frameTree }).forEach((frameId) => {
+        sendMessage({
+          method: 'forwardCDPEvent',
+          params: { sessionId, method: 'Page.frameDetached', params: { frameId, reason: 'remove' } },
+        })
       })
-    })
+      const frameChanges = takeFrameChanges({ tabId, frameTree, navigated })
+      frameChanges.forEach(({ method, params }) => {
+        sendMessage({ method: 'forwardCDPEvent', params: { sessionId, method, params } })
+      })
+      return frameChanges.some(({ method }) => method === 'Page.frameNavigated')
+    }
 
+    // The replayed Runtime.enable and lifecycle events below then describe these documents
+    const newDocument = await reportFrames({ navigated: navigated ?? false })
     const failures = await replaySetup({
       tabId,
-      send: (method, params) => {
-        return sendCommandWithTimeout({ tabId }, method, params, 10000)
+      newDocument,
+      documentChanged: () => {
+        return countNavigations(tabId).documents !== navigationsBefore.documents
       },
+      send,
     })
     failures.forEach(({ method, error }) => {
       logger.warn('Failed to replay CDP command after reattach:', method, 'tab:', tabId, error)
     })
+
+    // The page can navigate while we reattach, for example when the user submits a sign-in
+    // form just as its password manager's menu closes. Chrome reports a navigation only once
+    // Page.enable is replayed, so compare the frame tree again with what Playwright was told.
+    let navigationsSeen = navigationsBefore.total
+    for (let pass = 0; pass < 3 && countNavigations(tabId).total !== navigationsSeen; pass++) {
+      navigationsSeen = countNavigations(tabId).total
+      if (await reportFrames({ navigated: false })) {
+        await replayLifecycleEvents({ tabId, send })
+      }
+    }
     logger.warn(`Reattached debugger to tab ${tabId}`)
     return true
   } catch (error) {
@@ -1815,17 +2047,45 @@ type AttachTabResult = {
 // Chromium marked this Won't Fix (Intended Behavior): https://issues.chromium.org/issues/498987209
 // See: https://github.com/remorses/playwriter/issues/18
 async function removeRestrictedIframes(tabId: number): Promise<number> {
+  const removed = await scanRestrictedIframes({ tabId, remove: true })
+  if (removed.length > 0) {
+    logger.warn(
+      `Removed ${removed.length} chrome-extension:// iframe(s) from tab ${tabId}, injected by:`,
+      [...new Set(removed.map((frame) => frame.extId))].join(', '),
+    )
+  }
+  return removed.length
+}
+
+type RestrictedIframe = { extId: string; visible: boolean }
+
+async function findRestrictedIframes(tabId: number): Promise<RestrictedIframe[]> {
+  return await scanRestrictedIframes({ tabId, remove: false })
+}
+
+// Lists each chrome-extension:// iframe another extension put in the tab.
+async function scanRestrictedIframes({
+  tabId,
+  remove,
+}: {
+  tabId: number
+  remove: boolean
+}): Promise<RestrictedIframe[]> {
   try {
     const results = await chrome.scripting.executeScript({
       // allFrames: true ensures we also scan same-origin subframes, not just the top document.
       target: { tabId, allFrames: true },
       // Runs before every attach: never wait for a loading page to reach document_idle
       injectImmediately: true,
-      func: (ownExtIds: string[]) => {
-        // Returns the extension ids of removed iframes. Extensions like 1Password put their
-        // iframes in closed shadow roots, only reachable via chrome.dom from an isolated world.
-        const removeFrom = (root: Document | ShadowRoot): string[] => {
-          const removed = Array.from(root.querySelectorAll('iframe')).flatMap((iframe) => {
+      func: (ownExtIds: string[], remove: boolean) => {
+        // Extensions like 1Password put their iframes in closed shadow roots, only reachable
+        // via chrome.dom from an isolated world. `host` is the outermost element such an
+        // extension added for its UI: a closed shadow root on an element with no children.
+        const scan = (
+          root: Document | ShadowRoot,
+          host: Element | null,
+        ): Array<{ extId: string; visible: boolean }> => {
+          const found = Array.from(root.querySelectorAll('iframe')).flatMap((iframe) => {
             const src = iframe.src || iframe.getAttribute('src') || ''
             if (!src.startsWith('chrome-extension://')) {
               return []
@@ -1834,32 +2094,38 @@ async function removeRestrictedIframes(tabId: number): Promise<number> {
             if (ownExtIds.includes(extId)) {
               return []
             }
-            iframe.remove()
-            return [extId]
+            const rect = iframe.getBoundingClientRect()
+            const visible =
+              rect.width > 1 &&
+              rect.height > 1 &&
+              iframe.checkVisibility({ opacityProperty: true, visibilityProperty: true })
+            if (remove) {
+              // Remove the host when there is one. Proton Pass rebuilds its UI when its root
+              // element goes, but keeps a dead menu until reload when only the iframe does.
+              ;(host ?? iframe).remove()
+            }
+            return [{ extId, visible }]
           })
           const nested = Array.from(root.querySelectorAll('*')).flatMap((el) => {
             const shadow = el instanceof HTMLElement ? chrome.dom.openOrClosedShadowRoot(el) : null
-            return shadow ? removeFrom(shadow) : []
+            if (!shadow) {
+              return []
+            }
+            const ownHost = shadow.mode === 'closed' && el.childNodes.length === 0 ? el : null
+            return scan(shadow, host ?? ownHost)
           })
-          return [...removed, ...nested]
+          return [...found, ...nested]
         }
-        return removeFrom(document)
+        return scan(document, null)
       },
-      args: [OUR_EXTENSION_IDS],
+      args: [OUR_EXTENSION_IDS, remove],
     })
-    const removedExtIds = results.flatMap((r) => r.result ?? [])
-    if (removedExtIds.length > 0) {
-      logger.warn(
-        `Removed ${removedExtIds.length} chrome-extension:// iframe(s) from tab ${tabId}, injected by:`,
-        [...new Set(removedExtIds)].join(', '),
-      )
-    }
-    return removedExtIds.length
+    return results.flatMap((r) => r.result ?? [])
   } catch (e) {
     // Scripting may fail on restricted pages (chrome://, about:, etc.) — that's fine,
     // those pages won't have extension iframes anyway.
-    logger.debug('Could not remove restricted iframes (expected on some pages):', (e as Error).message)
-    return 0
+    logger.debug('Could not scan for restricted iframes (expected on some pages):', (e as Error).message)
+    return []
   }
 }
 
@@ -2044,6 +2310,7 @@ async function attachTabDebugger(
 
 function detachTab(tabId: number, shouldDetachDebugger: boolean): void {
   userApprovedExtensionPageTabs.delete(tabId)
+  forgetYield(tabId)
   const tab = store.getState().tabs.get(tabId)
   if (!tab) {
     logger.debug('detachTab: tab not found in map:', tabId)
@@ -3979,6 +4246,13 @@ function playSound(sound: SoundName): void {
 
 // Handle messages from the in-page toolbar
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Sent by the content script when the page says the user is done (handoff's Done button).
+  if (message.action === 'resumeYieldedTab') {
+    if (sender.tab?.id !== undefined) {
+      void resumeTab({ tabId: sender.tab.id, reason: 'page asked' })
+    }
+    return false
+  }
   // Sent by the toolbar after its in-page confirm dialog.
   if (message.action === 'remoteControlStart') {
     const tabId = getToolbarSenderTabId(sender)
@@ -4088,6 +4362,24 @@ chrome.webNavigation.onCommitted.addListener((details) => {
   }
   logger.warn('Detaching tab that navigated to an extension page:', details.tabId)
   detachTab(details.tabId, true)
+})
+
+// A yielded tab has no debugger to report navigations, chrome.webNavigation still does.
+// A new document starts without the other extension's frame, so attaching again is free.
+chrome.webNavigation.onCommitted.addListener((details) => {
+  if (details.frameId === 0) {
+    onMainFrameNavigation({ tabId: details.tabId, newDocument: true })
+  }
+})
+chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+  if (details.frameId === 0) {
+    onMainFrameNavigation({ tabId: details.tabId, newDocument: false })
+  }
+})
+chrome.webNavigation.onReferenceFragmentUpdated.addListener((details) => {
+  if (details.frameId === 0) {
+    onMainFrameNavigation({ tabId: details.tabId, newDocument: false })
+  }
 })
 
 // Re-inject the toolbar after hard navigations in connected tabs.

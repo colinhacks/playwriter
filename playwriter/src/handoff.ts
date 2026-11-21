@@ -17,8 +17,9 @@
  *   CSP refuses
  */
 
-import type { Locator, Page } from '@xmorse/playwright-core'
+import type { BrowserContext, Locator, Page } from '@xmorse/playwright-core'
 import util from 'node:util'
+import { getCDPSessionForPage } from './cdp-session.js'
 import { evaluateIsolated } from './playwright-import.js'
 import { sleep } from './utils.js'
 
@@ -53,6 +54,39 @@ const TARGET_ATTR = 'data-playwriter-handoff-target'
 const CONFIRM_MS = 1200
 
 const handoffs = new WeakMap<Page, { spec: CardSpec; rerender: () => void }>()
+// Pages with a handoff showing. The user often needs another extension in such a tab, like their
+// password manager's menu, and Chrome allows either that extension's frame or our debugger in a
+// tab. So while the agent only waits (no execute runs, or waitForHandoff does), the extension
+// stays out of the frame's way instead of removing it: see yieldTab in extension/src/background.ts.
+const handoffPages = new Set<Page>()
+
+async function setYield({ page, enabled }: { page: Page; enabled: boolean }): Promise<void> {
+  try {
+    const cdp = await getCDPSessionForPage({ page })
+    await cdp.send('Playwriter.setYield' as never, { enabled } as never)
+  } catch {
+    // An extension that cannot yield yet, or a browser driven without the extension:
+    // other extensions' frames are removed as before.
+  }
+}
+
+/** Called around every execute: the agent takes its handed-off tabs back while its code runs. */
+export async function setHandoffYield({
+  context,
+  enabled,
+}: {
+  context: BrowserContext | null
+  enabled: boolean
+}): Promise<void> {
+  const pages = [...handoffPages].filter((page) => {
+    return !page.isClosed() && page.context() === context
+  })
+  await Promise.all(
+    pages.map((page) => {
+      return setYield({ page, enabled })
+    }),
+  )
+}
 
 export async function handoff({ page, message, target, manual = false }: HandoffOptions): Promise<void> {
   await clearTarget({ page })
@@ -70,19 +104,27 @@ export async function waitForHandoff({ page, until, timeout = 0 }: WaitForHandof
     throw new Error('waitForHandoff: no handoff is showing on this page. Call handoff({ page, message }) first.')
   }
   const options = { polling: 500, timeout }
-  if (current.spec.manual) {
-    await page.waitForFunction((id) => document.getElementById(id)?.dataset.done === '1', HOST_ID, options)
-  } else if (util.types.isRegExp(until)) {
-    // sandbox code builds its RegExp in another realm, so `instanceof RegExp` would be false
-    await page.waitForFunction(
-      ({ source, flags }) => new RegExp(source, flags).test(window.location.href),
-      { source: until.source, flags: until.flags },
-      options,
-    )
-  } else if (typeof until === 'function') {
-    await page.waitForFunction(until, undefined, options)
-  } else {
-    throw new Error('waitForHandoff needs `until` (a URL RegExp or a page function), or a handoff with `manual: true`')
+  // Waiting is the one thing an execute does that leaves the tab to the user
+  await setYield({ page, enabled: true })
+  try {
+    if (current.spec.manual) {
+      await page.waitForFunction((id) => document.getElementById(id)?.dataset.done === '1', HOST_ID, options)
+    } else if (util.types.isRegExp(until)) {
+      // sandbox code builds its RegExp in another realm, so `instanceof RegExp` would be false
+      await page.waitForFunction(
+        ({ source, flags }) => new RegExp(source, flags).test(window.location.href),
+        { source: until.source, flags: until.flags },
+        options,
+      )
+    } else if (typeof until === 'function') {
+      await page.waitForFunction(until, undefined, options)
+    } else {
+      throw new Error(
+        'waitForHandoff needs `until` (a URL RegExp or a page function), or a handoff with `manual: true`',
+      )
+    }
+  } finally {
+    await setYield({ page, enabled: false })
   }
   await showCard({ page, spec: { ...current.spec, done: true } })
   await sleep(CONFIRM_MS)
@@ -96,6 +138,8 @@ export async function clearHandoff({ page }: { page: Page }): Promise<void> {
     page.off('domcontentloaded', current.rerender)
     handoffs.delete(page)
   }
+  handoffPages.delete(page)
+  await setYield({ page, enabled: false })
   await evaluateIsolated({
     target: page,
     fn: (ids: string[]) => ids.forEach((id) => document.getElementById(id)?.remove()),
@@ -132,6 +176,10 @@ async function showCard({ page, spec }: { page: Page; spec: CardSpec }): Promise
     evaluateIsolated({ target: page, fn: renderCard, arg }).catch(() => {})
   }
   handoffs.set(page, { spec, rerender })
+  handoffPages.add(page)
+  page.once('close', () => {
+    handoffPages.delete(page)
+  })
   page.on('domcontentloaded', rerender)
   await evaluateIsolated({ target: page, fn: renderCard, arg })
 }
@@ -210,6 +258,8 @@ function renderCard(arg: RenderArg): void {
       button.type = 'button'
       button.addEventListener('click', () => {
         host.dataset.done = '1'
+        // A tab yielded to another extension has no debugger watching for Done: ask for it back
+        document.dispatchEvent(new CustomEvent('playwriter:resume'))
       })
       foot.append(button)
     }

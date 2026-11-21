@@ -37,6 +37,12 @@ function installPlaywriterContentScript(): void {
     true,
   )
 
+  // The page can ask for a yielded tab back, like handoff's Done button does. Asking is always
+  // safe: resuming is what Playwriter did before it could yield.
+  document.addEventListener('playwriter:resume', () => {
+    void chrome.runtime.sendMessage({ action: 'resumeYieldedTab' }).catch(() => {})
+  })
+
   let toastTimer: number | undefined
   let toastHost: HTMLDivElement | null = null
 

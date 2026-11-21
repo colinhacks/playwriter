@@ -3,6 +3,7 @@ import type { ExtensionState } from 'mcp-extension/src/types.js'
 declare global {
   var toggleExtensionForActiveTab: () => Promise<{ isConnected: boolean; state: ExtensionState }>
   var getExtensionState: () => ExtensionState
+  var getYieldState: () => { yieldMode: number[]; yielded: number[] }
   var disconnectEverything: () => Promise<void>
   var startRemoteControlForActiveTab: () => Promise<{ url: string }>
   var stopRemoteControl: () => boolean
